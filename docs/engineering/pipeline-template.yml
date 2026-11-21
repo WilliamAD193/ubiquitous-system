@@ -1,0 +1,230 @@
+# ==============================================================================
+# Meridian Mutual — Reusable Multi-Country Deployment Pipeline Template
+# Target: Azure Pipelines / GitHub Actions compatible YAML
+# Scope: BFFs, Experience APIs, and Process APIs
+# Governed by: Engineering Standards (docs/engineering/ENGINEERING_STANDARDS.md)
+# ==============================================================================
+
+name: $(Date:yyyyMMdd)$(Rev:.r)-$(Build.SourceBranchName)
+
+trigger:
+  branches:
+    include:
+      - main
+      - releases/*
+  paths:
+    exclude:
+      - docs/**
+      - README.md
+      - '*.md'
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: meridian-global-pipeline-vars
+  - name: dockerRegistryServiceConnection
+    value: 'meridian-acr-service-connection'
+  - name: imageRepository
+    value: 'channel-services/channel-bff'
+  - name: containerRegistry
+    value: 'meridiancr.azurecr.io'
+  - name: sonarProjectKey
+    value: 'meridian_channel-bff'
+
+stages:
+  # ============================================================================
+  # STAGE 1: Build, Test, Security & Quality Gates
+  # ============================================================================
+  - stage: BuildAndValidate
+    displayName: '1. Build, Quality & Security Gates'
+    jobs:
+      - job: CompileAndScan
+        displayName: 'Compile, Test & Security Analysis'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: UseJavaVersion@0
+            inputs:
+              versionSpec: '21'
+              jdkArchitectureOption: 'x64'
+
+          # Secret Scanning Gate (Gitleaks)
+          - script: |
+              docker run -v $(Build.SourcesDirectory):/path zricethezav/gitleaks:latest detect --source="/path" --verbose
+            displayName: 'Gate: Gitleaks Secret Scanning'
+
+          # Compile and Unit Tests with JaCoCo Coverage
+          - script: |
+              mvn clean verify -B \
+                -Dspring.profiles.active=test \
+                -Djacoco.destFile=$(Build.ArtifactStagingDirectory)/jacoco.exec
+            displayName: 'Compile & Execute Unit/Integration Tests'
+
+          # Static Code Analysis (SonarQube)
+          - task: SonarQubePrepare@5
+            inputs:
+              SonarQube: 'meridian-sonarqube-connection'
+              scannerMode: 'Other'
+              extraProperties: |
+                sonar.projectKey=$(sonarProjectKey)
+                sonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                sonar.qualitygate.wait=true
+            displayName: 'Prepare SonarQube Analysis'
+
+          - task: SonarQubeAnalyze@5
+            displayName: 'Gate: SonarQube Analysis'
+
+          # Consumer-Driven Contract Verification (Pact)
+          - script: |
+              mvn pact:verify -Dpact.broker.url=$(PACT_BROKER_URL) -Dpact.broker.token=$(PACT_BROKER_TOKEN)
+            displayName: 'Gate: Pact Contract Verification'
+
+          # Software Composition Analysis (Snyk / OWASP)
+          - task: SnykSecurityScan@1
+            inputs:
+              serviceConnectionEndpoint: 'meridian-snyk-connection'
+              appType: 'maven'
+              severityThreshold: 'high'
+              failOnIssues: true
+            displayName: 'Gate: Snyk Vulnerability & License Scan'
+
+          # Build and Push Immutable Container Image to ACR
+          - task: Docker@2
+            displayName: 'Build and Push Docker Image'
+            inputs:
+              command: buildAndPush
+              repository: $(imageRepository)
+              dockerfile: '**/Dockerfile'
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(Build.BuildId)
+                latest
+
+  # ============================================================================
+  # STAGE 2: Deploy to Lower Environments (Development & Regional UAT)
+  # ============================================================================
+  - stage: DeployUAT
+    displayName: '2. Staging & Performance Verification'
+    dependsOn: BuildAndValidate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployToUAT
+        displayName: 'Deploy to Regional UAT'
+        environment: 'meridian-channel-uat'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureContainerApps@1
+                  displayName: 'Deploy to Azure Container Apps (UAT)'
+                  inputs:
+                    azureSubscription: 'meridian-azure-prod'
+                    containerAppName: 'channel-bff-uat'
+                    resourceGroup: 'rg-channel-uat'
+                    imageToDeploy: '$(containerRegistry)/$(imageRepository):$(Build.BuildId)'
+
+      - job: AutomatedPerformanceGate
+        displayName: 'Gate: Automated Performance & SLO Verification'
+        dependsOn: DeployToUAT
+        steps:
+          # Non-Functional Performance Test (k6) - Verifies C2 (< 2.5s p95 at 150% load)
+          - script: |
+              k6 run tests/perf/quote-load-test.js \
+                -e TARGET_URL=https://uat.meridianmutual.com/channel-bff \
+                --threshold 'http_req_duration{quantile:0.95}<2500' \
+                --threshold 'http_req_failed<0.01'
+            displayName: 'Gate: k6 Performance Test (p95 < 2.5s)'
+
+  # ============================================================================
+  # STAGE 3: Progressive Production Rollout — Country 1: Mexico (MX Pilot)
+  # ============================================================================
+  - stage: DeployProdMexico
+    displayName: '3. Production Rollout — Mexico (MX Pilot)'
+    dependsOn: DeployUAT
+    jobs:
+      - deployment: DeployCanaryMX
+        displayName: 'Deploy Canary (10% Traffic) to Mexico'
+        environment: 'meridian-prod-mexico'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureContainerApps@1
+                  displayName: 'Deploy Canary Revision to channel-bff-mx'
+                  inputs:
+                    azureSubscription: 'meridian-azure-prod'
+                    containerAppName: 'channel-bff-mx'
+                    resourceGroup: 'rg-channel-prod-mx'
+                    imageToDeploy: '$(containerRegistry)/$(imageRepository):$(Build.BuildId)'
+                    targetPort: 8080
+                    # Progressive traffic split
+                    trafficWeight: 10
+
+          # Automated Observation Window (15 minutes)
+          postRouteTraffic:
+            steps:
+              - script: |
+                  echo "Observing telemetry in Azure Monitor for 15 minutes..."
+                  python scripts/monitor_canary.py --app channel-bff-mx --duration 900 --error-threshold 0.005
+                displayName: 'Gate: 15-min Canary Telemetry & Error Rate Observation'
+
+      - job: PromoteFullTrafficMX
+        displayName: 'Promote 100% Traffic to Mexico'
+        dependsOn: DeployCanaryMX
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Shift 100% Traffic to New Revision'
+            inputs:
+              azureSubscription: 'meridian-azure-prod'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az containerapp ingress traffic set \
+                  --name channel-bff-mx \
+                  --resource-group rg-channel-prod-mx \
+                  --revision-weight latest=100
+
+  # ============================================================================
+  # STAGE 4: Progressive Production Rollout — Country 2: Colombia (CO)
+  # ============================================================================
+  - stage: DeployProdColombia
+    displayName: '4. Production Rollout — Colombia (CO)'
+    dependsOn: DeployProdMexico
+    jobs:
+      - deployment: DeployColombia
+        displayName: 'Deploy to Colombia'
+        environment: 'meridian-prod-colombia'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureContainerApps@1
+                  inputs:
+                    azureSubscription: 'meridian-azure-prod'
+                    containerAppName: 'channel-bff-co'
+                    resourceGroup: 'rg-channel-prod-co'
+                    imageToDeploy: '$(containerRegistry)/$(imageRepository):$(Build.BuildId)'
+
+  # ============================================================================
+  # STAGE 5: Progressive Production Rollout — Country 3: Chile (CL)
+  # ============================================================================
+  - stage: DeployProdChile
+    displayName: '5. Production Rollout — Chile (CL)'
+    dependsOn: DeployProdColombia
+    jobs:
+      - deployment: DeployChile
+        displayName: 'Deploy to Chile'
+        environment: 'meridian-prod-chile'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureContainerApps@1
+                  inputs:
+                    azureSubscription: 'meridian-azure-prod'
+                    containerAppName: 'channel-bff-cl'
+                    resourceGroup: 'rg-channel-prod-cl'
+                    imageToDeploy: '$(containerRegistry)/$(imageRepository):$(Build.BuildId)'
