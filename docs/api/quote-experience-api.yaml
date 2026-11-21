@@ -1,0 +1,351 @@
+openapi: 3.0.3
+info:
+  title: Meridian Mutual - Regional Quote Experience API (quote-xapi)
+  description: |
+    Regional Experience API for the Direct Digital Channel.
+    Provides standardized quote creation and retrieval capabilities across Mexico, Colombia, and Chile.
+    Adheres to Meridian Mutual Architecture Standards (C1, C2, C3, C4, C5, C6).
+  version: 1.2.0
+  contact:
+    name: Direct Digital Channel Architecture Team
+    email: architecture-channel@meridianmutual.com
+
+servers:
+  - url: https://api.meridianmutual.com/quote-xapi/v1
+    description: Production Regional Gateway (Azure API Management / MuleSoft API Manager)
+  - url: https://api-uat.meridianmutual.com/quote-xapi/v1
+    description: UAT Environment Gateway
+
+security:
+  - OpenIDConnectBearer:
+      - quotes:read
+      - quotes:write
+
+paths:
+  /quotes:
+    post:
+      summary: Create a Home Essentials Insurance Quote
+      description: |
+        Generates a binding insurance quote for Home Essentials based on property details.
+        The country context is extracted from the authenticated JWT token claim (`ctry`), with optional 
+        fallback to the mandatory `X-Country` header which must strictly match the token claim (C5).
+      operationId: createHomeQuote
+      tags:
+        - Quotes
+      parameters:
+        - name: X-Country
+          in: header
+          required: true
+          description: Target ISO country code (MX, CO, CL). Must match the authenticated token claim.
+          schema:
+            $ref: '#/components/schemas/CountryCode'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Unique client-generated UUID to ensure idempotent quote generation upon retries.
+          schema:
+            type: string
+            format: uuid
+            example: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateHomeQuoteRequest'
+      responses:
+        '201':
+          description: Quote created successfully.
+          headers:
+            Location:
+              description: Relative URI of the created quote resource.
+              schema:
+                type: string
+                example: /quotes/q-88491-mx
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HomeQuoteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /quotes/{quoteId}:
+    get:
+      summary: Retrieve an existing Quote
+      description: |
+        Retrieves full details of a previously generated quote. Cross-tenant access is strictly 
+        prohibited: callers may only access quotes belonging to their authorized country and identity.
+      operationId: getQuoteById
+      tags:
+        - Quotes
+      parameters:
+        - name: quoteId
+          in: path
+          required: true
+          description: Unique identifier of the quote.
+          schema:
+            type: string
+            example: q-88491-mx
+        - name: X-Country
+          in: header
+          required: true
+          description: Country identifier of the target quote.
+          schema:
+            $ref: '#/components/schemas/CountryCode'
+      responses:
+        '200':
+          description: Quote retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HomeQuoteResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    OpenIDConnectBearer:
+      type: oauth2
+      description: Meridian Mutual Central Identity Provider (OIDC - Customer & Workforce Realms)
+      flows:
+        authorizationCode:
+          authorizationUrl: https://idp.meridianmutual.com/oauth2/v1/authorize
+          tokenUrl: https://idp.meridianmutual.com/oauth2/v1/token
+          scopes:
+            quotes:read: Read quote details
+            quotes:write: Create and bind new quotes
+
+  schemas:
+    CountryCode:
+      type: string
+      enum: [MX, CO, CL]
+      example: MX
+
+    CurrencyCode:
+      type: string
+      enum: [MXN, COP, CLP]
+      example: MXN
+
+    CreateHomeQuoteRequest:
+      type: object
+      required:
+        - productCode
+        - propertyDetails
+      properties:
+        productCode:
+          type: string
+          enum: [HOME-ESSENTIALS]
+          example: HOME-ESSENTIALS
+        propertyDetails:
+          $ref: '#/components/schemas/PropertyDetails'
+        coverageOptions:
+          $ref: '#/components/schemas/CoverageOptions'
+
+    PropertyDetails:
+      type: object
+      required:
+        - postalCode
+        - squareMeters
+        - propertyType
+      properties:
+        postalCode:
+          type: string
+          description: Country-specific postal/zip code.
+          example: "06600"
+        squareMeters:
+          type: integer
+          minimum: 20
+          maximum: 2000
+          description: Built area in square meters.
+          example: 95
+        propertyType:
+          type: string
+          enum: [APARTMENT, HOUSE, GATED_COMMUNITY]
+          example: APARTMENT
+        floorNumber:
+          type: integer
+          minimum: 0
+          maximum: 100
+          example: 4
+
+    CoverageOptions:
+      type: object
+      required:
+        - includesContents
+      properties:
+        includesContents:
+          type: boolean
+          description: Whether home contents (furniture, electronics) are covered.
+          example: true
+        earthquakeCoverage:
+          type: boolean
+          description: Optional earthquake/natural disaster rider.
+          example: false
+
+    HomeQuoteResponse:
+      type: object
+      required:
+        - quoteId
+        - productCode
+        - country
+        - currency
+        - premiumAmount
+        - totalPremium
+        - ratingTableVersion
+        - status
+        - createdAt
+        - expiresAt
+      properties:
+        quoteId:
+          type: string
+          example: q-88491-mx
+        productCode:
+          type: string
+          example: HOME-ESSENTIALS
+        country:
+          $ref: '#/components/schemas/CountryCode'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        premiumAmount:
+          type: number
+          format: double
+          description: Base premium before taxes and surcharges.
+          example: 3200.00
+        taxAmount:
+          type: number
+          format: double
+          description: Statutory tax (e.g. 16% IVA in MX, 19% in CO).
+          example: 512.00
+        totalPremium:
+          type: number
+          format: double
+          description: Total annual premium payable by customer (replaces and preserves backward compatibility).
+          example: 3712.00
+        monthlyPremium:
+          type: number
+          format: double
+          description: Indicative monthly instalment amount.
+          example: 309.33
+        ratingTableVersion:
+          type: string
+          description: Identifier of the rating table version used for premium calculation (C6 constraint).
+          example: "2026-09-30-0500-MX-V4"
+        status:
+          type: string
+          enum: [DRAFT, RATED, BOUND, EXPIRED]
+          example: RATED
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-11-20T21:00:00Z"
+        expiresAt:
+          type: string
+          format: date-time
+          description: Timestamp when this quote expires (typically 30 days from creation).
+          example: "2026-12-20T21:00:00Z"
+
+    ProblemDetails:
+      type: object
+      required:
+        - type
+        - title
+        - status
+        - detail
+        - instance
+        - errorCode
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://api.meridianmutual.com/errors/invalid-postal-code"
+        title:
+          type: string
+          example: "Invalid Postal Code"
+        status:
+          type: integer
+          example: 422
+        detail:
+          type: string
+          example: "The postal code 99999 does not exist in Mexico territorial rating tables."
+        instance:
+          type: string
+          example: "/quotes"
+        errorCode:
+          type: string
+          example: "ERR_RATING_TERRITORY_NOT_FOUND"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-11-20T21:05:00Z"
+
+  responses:
+    BadRequest:
+      description: Malformed syntax or missing mandatory request elements.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    Unauthorized:
+      description: Authentication failure, expired token, or invalid signature.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    Forbidden:
+      description: Insufficient authorization or cross-country tenant mismatch (C5).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    NotFound:
+      description: The requested quote identifier was not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    UnprocessableEntity:
+      description: Business rule validation failure (e.g. uninsurable property or area).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    TooManyRequests:
+      description: Country-level rate limit or bulkhead queue threshold exceeded.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying request.
+          schema:
+            type: integer
+            example: 5
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+    ServiceUnavailable:
+      description: Downstream core or process dependency unavailable / circuit breaker open.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
